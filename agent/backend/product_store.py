@@ -77,11 +77,14 @@ class ProductStore:
 
     def _load_products(self):
         """加载JSON产品库（主产品库 + output/目录 + CSV精算数据）"""
-        # 1. 加载主产品库
-        with open(self.data_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.products = data.get("products", [])
-        print(f"[ProductStore] 主产品库已加载 {len(self.products)} 个产品")
+        # 1. 加载主产品库（文件不存在则跳过，仅用 output/ 数据）
+        if os.path.exists(self.data_path):
+            with open(self.data_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.products = data.get("products", [])
+            print(f"[ProductStore] 主产品库已加载 {len(self.products)} 个产品")
+        else:
+            print(f"[ProductStore] products.json 不存在，跳过主产品库加载")
 
         # 2. 加载 output/ 目录下的真实产品条款文件
         output_dir = os.path.join(os.path.dirname(self.data_path), "output")

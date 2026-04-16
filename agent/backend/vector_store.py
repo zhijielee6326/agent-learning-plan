@@ -74,14 +74,14 @@ class VectorStore:
     # ============ Embedding（异步） ============
 
     async def _get_embedding_async(self, text: str) -> List[float]:
-        """异步调用 Ollama 生成 embedding"""
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_BASE_URL}/embeddings",
-                json={"model": EMBEDDING_MODEL, "input": text}
-            )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
+        """异步调用 Ollama 生成 embedding（复用连接池）"""
+        client = self._get_async_client()
+        resp = await client.post(
+            f"{OLLAMA_BASE_URL}/embeddings",
+            json={"model": EMBEDDING_MODEL, "input": text}
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
 
     async def _get_embeddings_batch_async(self, texts: List[str]) -> List[List[float]]:
         """异步批量生成 embedding，并发请求"""
@@ -111,35 +111,35 @@ class VectorStore:
     # ============ Reranker（异步并发） ============
 
     async def _rerank_async(self, query: str, documents: List[str], top_k: int = 10) -> List[Tuple[int, float]]:
-        """异步并发调用 Reranker"""
+        """异步并发调用 Reranker（复用连接池）"""
         try:
             scores: List[float] = [0.0] * len(documents)
             ollama_chat_url = f"{OLLAMA_BASE_URL.replace('/v1', '')}/api/chat"
+            client = self._get_async_client()
 
             async def _score_doc(idx: int, doc: str):
                 try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.post(
-                            ollama_chat_url,
-                            json={
-                                "model": RERANKER_MODEL,
-                                "messages": [
-                                    {
-                                        "role": "user",
-                                        "content": f"Query: {query}\nDocument: {doc}\nRate the relevance of the document to the query on a scale of 0 to 1. Reply with only a number."
-                                    }
-                                ],
-                                "stream": False,
-                                "options": {"temperature": 0.0}
-                            },
-                        )
-                        resp.raise_for_status()
-                        content = resp.json().get("message", {}).get("content", "0").strip()
-                        try:
-                            scores[idx] = float(content)
-                        except ValueError:
-                            nums = re.findall(r'[0-9]*\.?[0-9]+', content)
-                            scores[idx] = float(nums[0]) if nums else 0.0
+                    resp = await client.post(
+                        ollama_chat_url,
+                        json={
+                            "model": RERANKER_MODEL,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": f"Query: {query}\nDocument: {doc}\nRate the relevance of the document to the query on a scale of 0 to 1. Reply with only a number."
+                                }
+                            ],
+                            "stream": False,
+                            "options": {"temperature": 0.0}
+                        },
+                    )
+                    resp.raise_for_status()
+                    content = resp.json().get("message", {}).get("content", "0").strip()
+                    try:
+                        scores[idx] = float(content)
+                    except ValueError:
+                        nums = re.findall(r'[0-9]*\.?[0-9]+', content)
+                        scores[idx] = float(nums[0]) if nums else 0.0
                 except Exception:
                     scores[idx] = 0.0
 

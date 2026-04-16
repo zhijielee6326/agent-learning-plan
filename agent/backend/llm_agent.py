@@ -118,6 +118,7 @@ class LLMAgent:
         self.store = store or get_product_store()
         self.vector_store = vector_store or get_vector_store()
         self.conversations: Dict[str, ConversationHistory] = {}
+        self._max_sessions = 100  # 最大会话数，防止内存泄漏
         self.api_key = LLM_API_KEY
         self.model = LLM_MODEL
         self.base_url = LLM_BASE_URL
@@ -126,6 +127,10 @@ class LLMAgent:
 
     def get_or_create_conversation(self, session_id: str) -> ConversationHistory:
         if session_id not in self.conversations:
+            # 超过上限时淘汰最旧的会话
+            if len(self.conversations) >= self._max_sessions:
+                oldest_id = min(self.conversations, key=lambda k: len(self.conversations[k].messages))
+                del self.conversations[oldest_id]
             conv = ConversationHistory(session_id=session_id)
             conv.add_message("system", SYSTEM_PROMPT)
             self.conversations[session_id] = conv
@@ -141,10 +146,10 @@ class LLMAgent:
             return False
         return any(kw in stripped for kw in self.INSURANCE_KEYWORDS)
 
-    def _retrieve_context(self, query: str) -> Dict:
-        """RAG检索：Qdrant 向量语义检索 + Reranker 精排"""
-        # 1. 向量语义检索 + Reranker
-        vector_results = self.vector_store.search(
+    async def _retrieve_context_async(self, query: str) -> Dict:
+        """RAG检索（异步）：Qdrant 向量语义检索 + Reranker 精排"""
+        # 1. 向量语义检索 + Reranker（异步）
+        vector_results = await self.vector_store.search_async(
             query=query,
             limit=20,
             min_score=0.2,
@@ -303,7 +308,7 @@ class LLMAgent:
             return
 
         # RAG模式：向量检索 + LLM
-        context = self._retrieve_context(query)
+        context = await self._retrieve_context_async(query)
 
         if context["sources"]:
             yield f"data: {json.dumps({'type': 'sources', 'sources': context['sources'][:20], 'matched_count': context['matched_count']}, ensure_ascii=False)}\n\n"
@@ -456,7 +461,7 @@ class LLMAgent:
 
     async def chat_static(self, query: str, session_id: str = "default") -> Dict:
         """非流式对话"""
-        context = self._retrieve_context(query)
+        context = await self._retrieve_context_async(query)
         messages = self._build_messages(session_id, query, context)
 
         if self._is_anthropic():

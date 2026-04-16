@@ -34,6 +34,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["content-disposition"],
 )
 
 # 全局实例
@@ -78,6 +79,9 @@ class EditRequest(BaseModel):
 
 class ClauseDraftRequest(BaseModel):
     query: str  # 如 "帮我生成一份人身意外伤害保险的产品条款"
+
+    def is_valid(self) -> bool:
+        return len(self.query.strip()) >= 4
 
 class WordExportRequest(BaseModel):
     content: str  # Markdown内容
@@ -181,6 +185,8 @@ async def list_chapters():
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
     """LLM智能对话 - 流式输出（SSE）- 支持条款生成意图路由"""
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="请输入您的问题")
     # 检测是否为条款生成意图
     if clause_agent.is_clause_generation_intent(request.query):
         async def clause_event_stream():
@@ -255,6 +261,8 @@ async def edit_stream(request: EditRequest):
 @app.post("/api/clause-draft/stream")
 async def clause_draft_stream(request: ClauseDraftRequest):
     """条款生成工作流 - 流式输出（SSE）"""
+    if not request.is_valid():
+        raise HTTPException(status_code=400, detail="请求内容过短，请描述您需要生成的保险产品类型")
     async def event_stream():
         async for chunk in clause_agent.draft_stream(request.query):
             yield chunk
@@ -296,72 +304,107 @@ async def export_word(request: WordExportRequest):
         date_para = doc.add_paragraph(f"生成日期：{datetime.now().strftime('%Y年%m月%d日')}")
         date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        doc.add_page_break()
+        # 添加分隔线（而非分页，避免空白页）
+        doc.add_paragraph("—")
+
+        # 解析 Markdown 内联格式（粗体、斜体、溯源标注）
+        def add_inline_text(para, text, base_size=12):
+            """解析并添加内联格式文本到段落"""
+            # 拆分溯源标注 [...]
+            parts = re.split(r'(\[[^\]]+\])', text)
+            for part in parts:
+                if re.match(r'\[.+\]', part):
+                    run = para.add_run(part)
+                    run.font.color.rgb = RGBColor(0, 102, 204)
+                    run.font.size = Pt(9)
+                else:
+                    # 拆分 **粗体** 和 *斜体*
+                    segments = re.split(r'(\*\*.+?\*\*|\*.+?\*)', part)
+                    for seg in segments:
+                        if seg.startswith('**') and seg.endswith('**'):
+                            run = para.add_run(seg[2:-2])
+                            run.font.size = Pt(base_size)
+                            run.bold = True
+                        elif seg.startswith('*') and seg.endswith('*'):
+                            run = para.add_run(seg[1:-1])
+                            run.font.size = Pt(base_size)
+                            run.italic = True
+                        else:
+                            if seg:
+                                run = para.add_run(seg)
+                                run.font.size = Pt(base_size)
 
         # 解析Markdown内容
         lines = request.content.split('\n')
+        in_list = False
         for line in lines:
             line = line.rstrip()
 
             if not line.strip():
-                doc.add_paragraph("")
                 continue
 
             # H1 标题
             if line.startswith('# ') and not line.startswith('## '):
-                heading_text = line[2:].strip()
+                heading_text = line[2:].replace('**', '').strip()
                 doc.add_heading(heading_text, level=1)
-
             # H2 标题
-            elif line.startswith('## '):
-                heading_text = line[3:].strip()
+            elif line.startswith('## ') and not line.startswith('### '):
+                heading_text = line[3:].replace('**', '').strip()
                 doc.add_heading(heading_text, level=2)
-
             # H3 标题
-            elif line.startswith('### '):
-                heading_text = line[4:].strip()
+            elif line.startswith('### ') and not line.startswith('#### '):
+                heading_text = line[4:].replace('**', '').strip()
                 doc.add_heading(heading_text, level=3)
+            # H4 标题
+            elif line.startswith('#### '):
+                heading_text = line[5:].replace('**', '').strip()
+                h = doc.add_heading(heading_text, level=4)
 
             # 引用块（溯源标注）
             elif line.startswith('> '):
                 quote_text = line[2:].strip()
                 para = doc.add_paragraph()
-                run = para.add_run(quote_text)
-                run.font.color.rgb = RGBColor(0, 102, 204)  # 蓝色
-                run.font.size = Pt(10)
+                add_inline_text(para, quote_text, base_size=10)
+                for run in para.runs:
+                    run.font.color.rgb = RGBColor(0, 102, 204)
 
             # 水平线
             elif line.strip() == '---':
                 doc.add_paragraph("—" * 40)
 
+            # 无序列表
+            elif line.strip().startswith('- ') or line.strip().startswith('• '):
+                text = re.sub(r'^[\s]*[-•]\s+', '', line)
+                para = doc.add_paragraph(style='List Bullet')
+                add_inline_text(para, text)
+
+            # 有序列表
+            elif re.match(r'^\s*\d+[\.、]\s', line):
+                text = re.sub(r'^\s*\d+[\.、]\s+', '', line)
+                para = doc.add_paragraph(style='List Number')
+                add_inline_text(para, text)
+
             # 普通段落
             else:
-                # 处理溯源标注 [产品名 > 章节名 > 条款]
-                parts = re.split(r'(\[[^\]]+\])', line)
                 para = doc.add_paragraph()
-                for part in parts:
-                    if re.match(r'\[.+\]', part):
-                        # 溯源标注用蓝色
-                        run = para.add_run(part)
-                        run.font.color.rgb = RGBColor(0, 102, 204)
-                        run.font.size = Pt(9)
-                    else:
-                        run = para.add_run(part)
-                        run.font.size = Pt(12)
+                add_inline_text(para, line)
 
         # 保存到内存
         from io import BytesIO
+        from urllib.parse import quote
         buffer = BytesIO()
         doc.save(buffer)
         buffer.seek(0)
 
-        filename = f"{request.title}_{datetime.now().strftime('%Y%m%d')}.docx"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        raw_filename = f"{request.title}_{timestamp}.docx"
+        encoded_filename = quote(raw_filename)
 
         return Response(
             content=buffer.getvalue(),
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}"
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
             }
         )
     except ImportError:
