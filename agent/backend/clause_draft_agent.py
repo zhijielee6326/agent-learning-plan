@@ -292,12 +292,12 @@ class ClauseDraftAgent:
                     continue
                 seen_contents.add(fingerprint)
 
-                # 重写编号
-                sub = re.sub(
-                    r'^第[一二三四五六七八九十百零\d]+条',
-                    f'第{self._num_to_chinese(clause_num)}条',
-                    sub
-                )
+                # 重写编号：如果已有"第X条"则替换，否则添加
+                new_prefix = f'第{self._num_to_chinese(clause_num)}条 '
+                if re.match(r'^第[一二三四五六七八九十百零\d]+条', sub):
+                    sub = re.sub(r'^第[一二三四五六七八九十百零\d]+条\s*', new_prefix, sub)
+                else:
+                    sub = new_prefix + sub
                 clause_num += 1
                 # 添加溯源标注
                 clauses.append(f"{sub} [{product_name} > {ref.get('chapter_name', chapter_name)}]")
