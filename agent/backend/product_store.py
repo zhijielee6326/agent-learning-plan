@@ -105,19 +105,21 @@ class ProductStore:
                     print(f"[ProductStore] 跳过文件 {fname}: {e}")
             print(f"[ProductStore] output/ 目录已加载 {output_count} 个真实产品条款")
 
-        # 3. 加载 CSV 精算数据
-        csv_dir = os.path.dirname(self.data_path)
+        # 3. 加载 CSV 精算数据（扫描 data/ 和 data/output/ 两个目录）
+        csv_dirs = [os.path.dirname(self.data_path)]
+        if os.path.isdir(output_dir):
+            csv_dirs.append(output_dir)
         csv_meta = {}  # 产品名 → 元数据
-        for csv_fname in os.listdir(csv_dir):
-            if csv_fname.endswith(".csv") and not csv_fname.startswith("."):
-                csv_path = os.path.join(csv_dir, csv_fname)
-                try:
-                    csv_count = self._load_csv_products(csv_path)
-                    # 收集 CSV 元数据用于回填 output 产品
-                    self._collect_csv_metadata(csv_path, csv_meta)
-                    print(f"[ProductStore] CSV文件 {csv_fname} 已加载 {csv_count} 个产品")
-                except Exception as e:
-                    print(f"[ProductStore] 加载CSV {csv_fname} 失败: {e}")
+        for csv_dir in csv_dirs:
+            for csv_fname in os.listdir(csv_dir):
+                if csv_fname.endswith(".csv") and not csv_fname.startswith("."):
+                    csv_path = os.path.join(csv_dir, csv_fname)
+                    try:
+                        csv_count = self._load_csv_products(csv_path)
+                        self._collect_csv_metadata(csv_path, csv_meta)
+                        print(f"[ProductStore] CSV文件 {csv_fname} 已加载 {csv_count} 个产品")
+                    except Exception as e:
+                        print(f"[ProductStore] 加载CSV {csv_fname} 失败: {e}")
 
         # 4. 用 CSV 元数据回填 output 产品的 filing_no / filing_time / registry_no
         backfilled = 0
