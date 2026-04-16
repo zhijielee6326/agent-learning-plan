@@ -105,39 +105,35 @@ class ClauseDraftAgent:
     def _extract_defined_terms(self, all_chapter_text: str, products: List[Dict]) -> List[str]:
         """从已生成章节文本和产品条款中提取需释义的名词"""
         found_terms = set()
-
-        # 1. 从已生成文本中提取「」和《》包裹的名词
+        # 1. 从「」包裹的名词
         bracket_terms = re.findall(r'「([^」]+)」', all_chapter_text)
         found_terms.update(bracket_terms)
-
-        # 2. 提取"以下简称XXX"模式
-        aka_terms = re.findall(r'以下简称[""\']?([^""\')】]{2,20})[""\']?', all_chapter_text)
+        # 2. "以下简称XXX"模式
+        aka_terms = re.findall(r'以下简称["""\']\s*([^""\""\')\s]{2,15})\s*["""\']?', all_chapter_text)
         found_terms.update(aka_terms)
-
-        # 3. 提取"（以下简称XXX）"模式
-        aka_terms2 = re.findall(r'[（(]以下简称([^)）]+)[)）]', all_chapter_text)
+        # 3. "（以下简称XXX）"模式
+        aka_terms2 = re.findall(r'[（(]以下简称\s*["""\']?\s*([^""\""\')\s]{2,15})\s*["""\']?\s*[)）]', all_chapter_text)
         found_terms.update(aka_terms2)
-
-        # 4. 从产品条款的"释义"章节中提取已有的名词
+        # 4. 从产品释义章节提取已有名词
         for product in products:
             for chapter in product.get("chapters", []):
                 ch_name = chapter.get("chapter_name", "")
                 if "释义" in ch_name:
                     for section in chapter.get("sections", []):
                         content = section.get("content", "")
-                        # 匹配 "XXX：..." 或 "XXX是指..." 模式
-                        defined = re.findall(r'^[一二三四五六七八九十\d]+[\.、]\s*([^：:是指]{2,20}?)[：:]', content, re.MULTILINE)
+                        defined = re.findall(r'^[一二三四五六七八九十\d]+[\.、]\s*([^：:是指]{2,15}?)[：:是指]', content, re.MULTILINE)
                         found_terms.update(defined)
-
-        # 5. 与常见术语列表取交集+补集（确保关键术语不遗漏）
-        text_lower = all_chapter_text
+        # 5. 常见术语列表匹配
         for term in self.COMMON_INSURANCE_TERMS:
-            if term in text_lower:
+            if term in all_chapter_text:
                 found_terms.add(term)
-
-        # 过滤太短或太长的
-        result = [t for t in found_terms if 2 <= len(t) <= 20]
-        return sorted(set(result))
+        # 清洗：去除引号、过滤无效名词
+        cleaned = set()
+        for t in found_terms:
+            t = t.strip().strip('"\'""''《》【】').strip()
+            if 2 <= len(t) <= 15 and re.match(r'^[a-zA-Z\u4e00-\u9fff]+$', t):
+                cleaned.add(t)
+        return sorted(cleaned)
 
     def _build_definition_chapter(self, terms: List[str], products: List[Dict],
                                    start_number: int) -> str:
