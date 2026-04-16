@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build output
+.next/
+out/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Debug / Screenshots
+debug_*.png
+screenshot.png
+ui_test_*.png
+reference_ui.jpg
+
+# Claude
+.claude/
+.mcp.json
+
+# Backend data (too large for git)
+backend/data/output/
+backend/data/pfa_actuarial_*.csv
+backend/data/definitions.json
+backend/*.log
