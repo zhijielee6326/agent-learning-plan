@@ -5,7 +5,8 @@
 import json
 import re
 import os
-from typing import AsyncGenerator, List, Dict
+import asyncio
+from typing import AsyncGenerator, List, Dict, Tuple
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -291,8 +292,62 @@ class ClauseDraftAgent:
 
     # ========== 主流程：流式生成 ==========
 
+    async def _generate_chapter_async(self, client: httpx.AsyncClient, chapter_name: str,
+                                       prompt: str) -> str:
+        """并发生成单个章节（非流式，收集完整文本）"""
+        try:
+            if _is_anthropic():
+                url = f"{LLM_BASE_URL}/v1/messages"
+                req_headers = _anthropic_headers()
+                payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
+                           "max_tokens": 4096, "temperature": 0.7, "stream": False}
+            else:
+                url = f"{LLM_BASE_URL}/chat/completions"
+                req_headers = _openai_headers()
+                payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
+                           "stream": False, "temperature": 0.7, "max_tokens": 4096}
+
+            resp = await client.post(url, headers=req_headers, json=payload)
+            print(f"[ClauseDraft-Parallel] 章节「{chapter_name}」HTTP {resp.status_code}")
+
+            if resp.status_code != 200:
+                print(f"[ClauseDraft-Parallel] Error: {resp.text[:300]}")
+                return ""
+
+            if _is_anthropic():
+                data = resp.json()
+                blocks = data.get("content", [])
+                return blocks[0].get("text", "") if blocks else ""
+            else:
+                data = resp.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except Exception as e:
+            print(f"[ClauseDraft-Parallel] 章节「{chapter_name}」异常: {e}")
+            return ""
+
+    @staticmethod
+    def _renumber_chapter(text: str, start_number: int) -> Tuple[str, int]:
+        """重排章节内的条款编号，从 start_number 开始，返回 (重排后文本, 下一条编号)"""
+        article_pattern = re.compile(r'^(\s*)第[一二三四五六七八九十百零\d]+条', re.MULTILINE)
+        matches = list(article_pattern.finditer(text))
+        if not matches:
+            return text, start_number
+
+        result = text
+        current_num = start_number
+        # 从后往前替换，避免偏移问题
+        for match in reversed(matches):
+            prefix = match.group(1)
+            new_text = f"{prefix}第{ClauseDraftAgent._num_to_chinese(current_num)}条"
+            result = result[:match.start()] + new_text + result[match.end():]
+            current_num += 1
+
+        return result, current_num
+
     async def draft_stream(self, query: str) -> AsyncGenerator[str, None]:
-        """流式生成条款（SSE格式）- LLM 驱动"""
+        """流式生成条款（SSE格式）- 并发 LLM 版本
+        所有章节并发调用 LLM，收集完成后统一重排编号、顺序输出
+        """
         import httpx
 
         try:
@@ -312,12 +367,10 @@ class ClauseDraftAgent:
             yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': f'找到 {len(products)} 个相关产品', 'products': product_names}, ensure_ascii=False)}\n\n"
 
             if not products:
-                # 兜底：使用产品库中最常见的产品类型作为参考
                 print(f"[ClauseDraft] 未找到「{insurance_type}」相关产品，回退到默认产品")
                 fallback_type = "意外伤害保险"
                 yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': f'未找到「{insurance_type}」的精确匹配，将以「{fallback_type}」类产品为参考生成'}, ensure_ascii=False)}\n\n"
                 insurance_type = fallback_type
-                # 从产品库中取前5个产品作为参考
                 for product in self.store.products[:5]:
                     full = self.store.get_product(product.get("id", ""))
                     if full:
@@ -334,110 +387,51 @@ class ClauseDraftAgent:
             if not chapters_to_generate:
                 chapters_to_generate = CLAUSE_CHAPTERS[:5]
 
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'chapters', 'message': f'将生成 {len(chapters_to_generate)} 个章节', 'chapters': chapters_to_generate}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'chapters', 'message': f'并发生成 {len(chapters_to_generate)} 个章节...', 'chapters': chapters_to_generate}, ensure_ascii=False)}\n\n"
 
-            # Step 4: 逐章节 LLM 生成
-            clause_number = 1
+            # Step 4: 并发调用 LLM 生成所有章节
+            # 每章给临时编号1起，后面统一重排
             async with httpx.AsyncClient(timeout=120.0) as client:
-                for idx, chapter_name in enumerate(chapters_to_generate):
+                tasks = []
+                for chapter_name in chapters_to_generate:
                     refs = chapter_refs.get(chapter_name, [])
-                    prompt = self._build_chapter_prompt(chapter_name, refs, insurance_type, chapters_to_generate, start_number=clause_number)
+                    prompt = self._build_chapter_prompt(chapter_name, refs, insurance_type, chapters_to_generate, start_number=1)
+                    tasks.append(self._generate_chapter_async(client, chapter_name, prompt))
 
-                    yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
+                # 并发执行所有章节生成
+                chapter_results = await asyncio.gather(*tasks)
 
-                    chapter_header = f"## {chapter_name}\n\n"
-                    yield f"data: {json.dumps({'type': 'content', 'content': chapter_header}, ensure_ascii=False)}\n\n"
+            print(f"[ClauseDraft-Parallel] 所有章节生成完成，开始输出")
 
-                    chapter_text = ""
-                    try:
-                        if _is_anthropic():
-                            url = f"{LLM_BASE_URL}/v1/messages"
-                            req_headers = _anthropic_headers()
-                            payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                                       "max_tokens": 4096, "temperature": 0.7, "stream": True}
-                        else:
-                            url = f"{LLM_BASE_URL}/chat/completions"
-                            req_headers = _openai_headers()
-                            payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                                       "stream": True, "temperature": 0.7, "max_tokens": 4096}
+            # Step 5: 统一重排编号并顺序输出
+            clause_number = 1
+            for idx, (chapter_name, chapter_text) in enumerate(zip(chapters_to_generate, chapter_results)):
+                yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
 
-                        async with client.stream("POST", url, headers=req_headers, json=payload) as response:
-                            print(f"[ClauseDraft] 章节「{chapter_name}」HTTP {response.status_code}")
-                            if response.status_code != 200:
-                                error_body = await response.aread()
-                                error_decoded = error_body.decode()[:300]
-                                print(f"[ClauseDraft] Error body: {error_decoded}")
-                                # 错误消息用 error 类型，不混入 content
-                                yield f"data: {json.dumps({'type': 'error', 'message': f'章节「{chapter_name}」LLM调用失败 (HTTP {response.status_code})'}, ensure_ascii=False)}\n\n"
-                                continue
+                chapter_header = f"## {chapter_name}\n\n"
+                yield f"data: {json.dumps({'type': 'content', 'content': chapter_header}, ensure_ascii=False)}\n\n"
 
-                            chunk_count = 0
-                            if _is_anthropic():
-                                async for line in response.aiter_lines():
-                                    line = line.strip()
-                                    if not line or line.startswith("event: "):
-                                        continue
-                                    if line.startswith("data: "):
-                                        try:
-                                            data = json.loads(line[6:].strip())
-                                            if data.get("type") == "content_block_delta":
-                                                delta = data.get("delta", {})
-                                                if delta.get("type") == "text_delta":
-                                                    text = delta.get("text", "")
-                                                    if text:
-                                                        chunk_count += 1
-                                                        chapter_text += text
-                                                        yield f"data: {json.dumps({'type': 'content', 'content': text}, ensure_ascii=False)}\n\n"
-                                            elif data.get("type") == "message_stop":
-                                                break
-                                        except json.JSONDecodeError:
-                                            continue
-                            else:
-                                async for line in response.aiter_lines():
-                                    if not line.startswith("data: "):
-                                        continue
-                                    data_str = line[6:].strip()
-                                    if data_str == "[DONE]":
-                                        break
-                                    try:
-                                        chunk = json.loads(data_str)
-                                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                        text = delta.get("content", "")
-                                        if text:
-                                            chunk_count += 1
-                                            chapter_text += text
-                                            yield f"data: {json.dumps({'type': 'content', 'content': text}, ensure_ascii=False)}\n\n"
-                                    except json.JSONDecodeError:
-                                        continue
+                # 空章节兜底
+                if len(chapter_text.strip()) < 20:
+                    print(f"[ClauseDraft-Parallel] 章节「{chapter_name}」内容过短，补充标准条款")
+                    chapter_text = f"第一条 本保险合同的{chapter_name}由保险人与投保人在投保时协商确定，具体内容以保险单载明为准。\n"
 
-                            print(f"[ClauseDraft] 章节「{chapter_name}」完成，收到 {chunk_count} 个文本块")
+                # 重排编号
+                renumbered, clause_number = self._renumber_chapter(chapter_text, clause_number)
 
-                        # 检测空章节
-                        if len(chapter_text.strip()) < 20:
-                            print(f"[ClauseDraft] 章节「{chapter_name}」内容过短，补充标准条款")
-                            fallback = f"第{self._num_to_chinese(clause_number)}条 本保险合同的{chapter_name}由保险人与投保人在投保时协商确定，具体内容以保险单载明为准。\n"
-                            chapter_text = fallback
-                            yield f"data: {json.dumps({'type': 'content', 'content': fallback}, ensure_ascii=False)}\n\n"
-                    except Exception as e:
-                        import traceback
-                        print(f"[ClauseDraft] 章节「{chapter_name}」异常: {e}")
-                        traceback.print_exc()
-                        yield f"data: {json.dumps({'type': 'error', 'message': f'章节「{chapter_name}」生成失败：{str(e)}'}, ensure_ascii=False)}\n\n"
+                # 流式输出（整章一次性输出，但用小chunk模拟流式效果）
+                chunk_size = 20
+                for i in range(0, len(renumbered), chunk_size):
+                    chunk = renumbered[i:i + chunk_size]
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
 
-                    # 只统计行首的"第X条"作为条款编号（排除正文引用）
-                    line_start_articles = re.findall(r'^\s*第[一二三四五六七八九十百零\d]+条', chapter_text, re.MULTILINE)
-                    if line_start_articles:
-                        clause_number += len(line_start_articles)
-                    else:
-                        clause_number += 2
+                yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
 
-                    yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
-
-            # Step 5: 完成
-            yield f"data: {json.dumps({'type': 'done', 'message': '条款生成完成', 'insurance_type': insurance_type, 'source_products': product_names}, ensure_ascii=False)}\n\n"
+            # Step 6: 完成
+            yield f"data: {json.dumps({'type': 'done', 'message': '条款生成完成（并发版）', 'insurance_type': insurance_type, 'source_products': product_names}, ensure_ascii=False)}\n\n"
 
         except Exception as e:
-            # 外层兜底：确保客户端总能收到反馈
             import traceback
             print(f"[ClauseDraft] draft_stream 外层异常: {e}")
             traceback.print_exc()
