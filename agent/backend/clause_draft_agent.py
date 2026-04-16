@@ -1,41 +1,17 @@
 """
-条款生成工作流 Agent
-- LLM 意图理解 → 向量语义检索 → 逐章节 LLM 生成（流式输出）→ 溯源标注
+条款生成工作流 Agent（模板拼装版本）
+- 规则意图识别 → 向量语义检索 → 章节聚合 → 模板拼装（不调用LLM）→ 溯源标注
 """
 import json
 import re
 import os
+import asyncio
 from typing import AsyncGenerator, List, Dict
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from product_store import ProductStore, get_product_store, STANDARD_CHAPTER_ORDER
-
-# API 配置（统一使用模块级常量）
-LLM_API_TYPE = os.getenv("LLM_API_TYPE", "openai")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "glm-5.1")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.z.ai/api/anthropic")
-
-
-def _is_anthropic() -> bool:
-    return LLM_API_TYPE == "anthropic"
-
-
-def _anthropic_headers() -> dict:
-    return {
-        "x-api-key": LLM_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json"
-    }
-
-
-def _openai_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
 # 标准章节列表（用于生成条款）
 CLAUSE_CHAPTERS = [
@@ -45,7 +21,7 @@ CLAUSE_CHAPTERS = [
 
 
 class ClauseDraftAgent:
-    """条款生成工作流 - LLM 驱动"""
+    """条款生成工作流 - 模板拼装（不调用LLM，纯检索+组装）"""
 
     def __init__(self, store: ProductStore = None, vector_store=None):
         self.store = store or get_product_store()
@@ -77,89 +53,25 @@ class ClauseDraftAgent:
                 return result + "零" + digits[remainder]
             if remainder < 20:
                 return result + "一十" + (digits[remainder - 10] if remainder > 10 else "")
-            # 20-99
             tens = remainder // 10
             ones = remainder % 10
             return result + digits[tens] + "十" + (digits[ones] if ones else "")
         return str(num)
 
-    # ========== Step 1: LLM 意图理解 ==========
+    # ========== Step 1: 规则意图识别（不调LLM） ==========
 
-    async def _extract_insurance_type_llm(self, query: str) -> str:
-        """让 LLM 理解用户意图，提取险种名称"""
-        import httpx
-
-        prompt = f"""你是一个保险产品分类专家。用户说了以下内容：
-
-"{query}"
-
-请从中提取用户想要生成的保险产品类型名称。
-
-规则：
-1. 只返回产品类型名称，不要任何解释
-2. 如果用户提到具体险种，直接返回（如"新能源车险"、"团体意外伤害保险"）
-3. 如果用户提到的是大类，返回具体的产品类型（如"医疗"→"医疗保险"）
-4. 不要添加"保险"二字如果原词中已经包含
-5. 只返回一个名称
-
-示例：
-- "帮我生成新能源车险的产品条款" → "新能源车险"
-- "起草一份重大疾病保险条款" → "重大疾病保险"
-- "生成人身意外伤害保险条款" → "人身意外伤害保险"
-- "写一个团体医疗险" → "团体医疗保险"
-- "帮我做一份工程保险" → "工程保险"
-
-请直接返回产品类型名称："""
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                if _is_anthropic():
-                    resp = await client.post(
-                        f"{LLM_BASE_URL}/v1/messages",
-                        headers=_anthropic_headers(),
-                        json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                              "max_tokens": 50, "temperature": 0.1}
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        blocks = data.get("content", [])
-                        result = blocks[0].get("text", "").strip() if blocks else ""
-                    else:
-                        result = ""
-                else:
-                    resp = await client.post(
-                        f"{LLM_BASE_URL}/chat/completions",
-                        headers=_openai_headers(),
-                        json={"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                              "temperature": 0.1, "max_tokens": 50}
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        result = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                    else:
-                        result = ""
-
-                if result:
-                    result = result.strip('"\'""''《》【】').strip()
-                    if result:
-                        print(f"[ClauseDraft] LLM 识别险种: {query} → {result}")
-                        return result
-                print(f"[ClauseDraft] LLM 意图识别失败, 回退到规则提取")
-        except Exception as e:
-            print(f"[ClauseDraft] LLM 意图识别异常: {e}, 回退到规则提取")
-
-        return self._fallback_extract(query)
-
-    def _fallback_extract(self, query: str) -> str:
-        """规则回退：去除常见指令词，提取产品名称"""
+    def _extract_insurance_type(self, query: str) -> str:
+        """规则提取险种名称"""
         clean = query
         # 先去除长前缀（避免短词误删）
-        for prefix in ["帮我生成一份", "帮我起草一份", "生成一份", "起草一份",
+        for prefix in ["帮我生成一份", "帮我起草一份", "帮我设计一份", "帮我创建一份",
+                        "生成一份", "起草一份", "设计一份", "创建一份",
                         "帮我写一份", "帮我做一份", "帮我生成", "帮我起草",
+                        "帮我设计", "帮我创建",
                         "的产品条款", "产品条款", "保险条款"]:
             clean = clean.replace(prefix, "")
         # 再去除短指令词（仅在词首/词尾匹配）
-        for word in ["生成", "起草", "撰写", "编写", "制作", "条款"]:
+        for word in ["生成", "起草", "撰写", "编写", "制作", "设计", "创建", "条款"]:
             clean = re.sub(rf'^{word}', '', clean)
             clean = re.sub(rf'{word}$', '', clean)
         clean = clean.strip()
@@ -182,9 +94,9 @@ class ClauseDraftAgent:
                     if pid and pid not in seen_ids:
                         matched_ids.append(pid)
                         seen_ids.add(pid)
-                print(f"[ClauseDraft] 向量语义检索找到 {len(matched_ids)} 个产品")
+                print(f"[ClauseDraft-Template] 向量语义检索找到 {len(matched_ids)} 个产品")
             except Exception as e:
-                print(f"[ClauseDraft] 向量检索失败: {e}")
+                print(f"[ClauseDraft-Template] 向量检索失败: {e}")
 
         # 2. 产品名模糊匹配（补充方式）
         search_terms = self._extract_search_terms(insurance_type)
@@ -201,7 +113,7 @@ class ClauseDraftAgent:
                     seen_ids.add(pid)
                     break
 
-        print(f"[ClauseDraft] 合计匹配 {len(matched_ids)} 个产品ID")
+        print(f"[ClauseDraft-Template] 合计匹配 {len(matched_ids)} 个产品ID")
 
         # 3. 获取完整产品数据
         full_products = []
@@ -210,7 +122,7 @@ class ClauseDraftAgent:
             if full:
                 full_products.append(full)
 
-        print(f"[ClauseDraft] 获取到 {len(full_products)} 个完整产品数据")
+        print(f"[ClauseDraft-Template] 获取到 {len(full_products)} 个完整产品数据")
         return full_products
 
     def _extract_search_terms(self, insurance_type: str) -> List[str]:
@@ -235,7 +147,6 @@ class ClauseDraftAgent:
             for chapter in product.get("chapters", []):
                 ch_name = chapter.get("chapter_name", "其他")
                 std_name = ch_name
-                # 优先匹配最长的标准章节名（避免短名误匹配）
                 for std in sorted(CLAUSE_CHAPTERS, key=len, reverse=True):
                     if std in ch_name or ch_name in std:
                         std_name = std
@@ -251,59 +162,69 @@ class ClauseDraftAgent:
                     })
         return chapters
 
-    # ========== Step 4: 章节生成 Prompt ==========
+    # ========== Step 4: 模板拼装 ==========
 
-    def _build_chapter_prompt(self, chapter_name: str, refs: List[Dict],
-                               insurance_type: str, all_chapters: List[str],
-                               start_number: int = 1) -> str:
-        """构建章节生成提示词"""
-        ref_texts = []
-        for r in refs[:8]:
-            snippet = r["content"][:500]
-            ref_texts.append(
-                f"【参考来源：{r['product_name']} > {r['chapter_name']}】\n{snippet}"
-            )
-        refs_block = "\n\n".join(ref_texts) if ref_texts else "（无直接参考，请根据行业标准生成）"
+    def _assemble_chapter(self, chapter_name: str, refs: List[Dict],
+                          start_number: int) -> str:
+        """模板拼装章节：从参考条款中选取、去重、合并、编号"""
+        if not refs:
+            return f"第{self._num_to_chinese(start_number)}条 本保险合同的{chapter_name}由保险人与投保人在投保时协商确定，具体内容以保险单载明为准。\n"
 
-        prompt = f"""你是一名资深保险条款起草专家。请根据以下参考内容，为「{insurance_type}」类保险产品起草「{chapter_name}」章节的条款。
+        seen_contents = set()
+        clauses = []
+        clause_num = start_number
 
-要求：
-1. 条款必须专业、严谨、符合中国保险监管法规
-2. 每条条款后标注来源，格式：[产品名 > 章节名]
-3. 如果参考内容有多条，需综合归纳，不可直接复制
-4. 语言风格与正式保险条款一致
-5. 直接输出条款内容，不要输出章节标题（系统会自动添加）
+        for ref in refs:
+            content = ref.get("content", "").strip()
+            product_name = ref.get("product_name", "未知产品")
 
-【重要】编号格式（必须严格遵守）：
-- 每条条款必须以「第X条」开头，使用中文数字（第一条、第二条…第十条、第十一条…）
-- 本章节从第{start_number}条开始连续编号
-- 正确：第{start_number}条 本保险合同……
-- 错误：1. 本保险合同……（禁止用阿拉伯数字加点）
-- 必须使用中文数字格式，不要用"1."、"2."格式！
+            # 按"第X条"分割为单条条款
+            sub_clauses = re.split(r'(?=第[一二三四五六七八九十百零\d]+条)', content)
+            for sub in sub_clauses:
+                sub = sub.strip()
+                if not sub or len(sub) < 10:
+                    continue
+                # 去重：取前50字作为指纹
+                fingerprint = sub[:50].replace(" ", "")
+                if fingerprint in seen_contents:
+                    continue
+                seen_contents.add(fingerprint)
 
-本产品章节结构：{' > '.join(all_chapters)}
+                # 重写编号
+                sub = re.sub(
+                    r'^第[一二三四五六七八九十百零\d]+条',
+                    f'第{self._num_to_chinese(clause_num)}条',
+                    sub
+                )
+                clause_num += 1
+                # 添加溯源标注
+                clauses.append(f"{sub} [{product_name} > {ref.get('chapter_name', chapter_name)}]")
 
-参考内容（来自真实产品条款）：
-{refs_block}
+            # 每章最多取 8 条，避免过长
+            if len(clauses) >= 8:
+                break
 
-请从第{start_number}条开始，生成「{chapter_name}」章节的完整条款内容（至少包含2条，即使参考较少也应根据行业标准补充）："""
-        return prompt
+        if not clauses:
+            return f"第{self._num_to_chinese(start_number)}条 本保险合同的{chapter_name}由保险人与投保人在投保时协商确定，具体内容以保险单载明为准。\n"
 
-    # ========== 主流程：流式生成 ==========
+        return "\n\n".join(clauses) + "\n"
+
+    # ========== 主流程：模板拼装流式输出 ==========
 
     async def draft_stream(self, query: str) -> AsyncGenerator[str, None]:
-        """流式生成条款（SSE格式）- LLM 驱动"""
-        import httpx
-
+        """流式生成条款（SSE格式）- 模板拼装版本
+        流程：规则意图识别 → 向量检索 → 章节聚合 → 去重合并 → 编号重排 → 输出
+        不调用 LLM，响应时间 < 2秒
+        """
         try:
-            # Step 1: LLM 理解用户意图，提取险种
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'intent', 'message': '正在理解您的需求...'}, ensure_ascii=False)}\n\n"
+            # Step 1: 规则提取险种
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'intent', 'message': '正在分析需求...'}, ensure_ascii=False)}\n\n"
 
-            insurance_type = await self._extract_insurance_type_llm(query)
+            insurance_type = self._extract_insurance_type(query)
 
             yield f"data: {json.dumps({'type': 'progress', 'step': 'intent', 'message': f'识别险种：{insurance_type}'}, ensure_ascii=False)}\n\n"
 
-            # Step 2: 检索相关产品（异步）
+            # Step 2: 向量检索相关产品
             yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': '正在从知识库中检索相关产品...'}, ensure_ascii=False)}\n\n"
 
             products = await self._search_related_products_async(insurance_type)
@@ -312,12 +233,10 @@ class ClauseDraftAgent:
             yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': f'找到 {len(products)} 个相关产品', 'products': product_names}, ensure_ascii=False)}\n\n"
 
             if not products:
-                # 兜底：使用产品库中最常见的产品类型作为参考
-                print(f"[ClauseDraft] 未找到「{insurance_type}」相关产品，回退到默认产品")
+                print(f"[ClauseDraft-Template] 未找到「{insurance_type}」相关产品，回退到默认产品")
                 fallback_type = "意外伤害保险"
-                yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': f'未找到「{insurance_type}」的精确匹配，将以「{fallback_type}」类产品为参考生成'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'progress', 'step': 'search', 'message': f'未找到精确匹配，将以「{fallback_type}」类产品为参考'}, ensure_ascii=False)}\n\n"
                 insurance_type = fallback_type
-                # 从产品库中取前5个产品作为参考
                 for product in self.store.products[:5]:
                     full = self.store.get_product(product.get("id", ""))
                     if full:
@@ -334,118 +253,46 @@ class ClauseDraftAgent:
             if not chapters_to_generate:
                 chapters_to_generate = CLAUSE_CHAPTERS[:5]
 
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'chapters', 'message': f'将生成 {len(chapters_to_generate)} 个章节', 'chapters': chapters_to_generate}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'chapters', 'message': f'模板拼装 {len(chapters_to_generate)} 个章节', 'chapters': chapters_to_generate}, ensure_ascii=False)}\n\n"
 
-            # Step 4: 逐章节 LLM 生成
+            # Step 4: 模板拼装 — 每章取最优参考，去重合并
             clause_number = 1
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                for idx, chapter_name in enumerate(chapters_to_generate):
-                    refs = chapter_refs.get(chapter_name, [])
-                    prompt = self._build_chapter_prompt(chapter_name, refs, insurance_type, chapters_to_generate, start_number=clause_number)
+            for idx, chapter_name in enumerate(chapters_to_generate):
+                yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
 
-                    yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
+                chapter_header = f"## {chapter_name}\n\n"
+                yield f"data: {json.dumps({'type': 'content', 'content': chapter_header}, ensure_ascii=False)}\n\n"
 
-                    chapter_header = f"## {chapter_name}\n\n"
-                    yield f"data: {json.dumps({'type': 'content', 'content': chapter_header}, ensure_ascii=False)}\n\n"
+                refs = chapter_refs.get(chapter_name, [])
+                chapter_text = self._assemble_chapter(chapter_name, refs, clause_number)
 
-                    chapter_text = ""
-                    try:
-                        if _is_anthropic():
-                            url = f"{LLM_BASE_URL}/v1/messages"
-                            req_headers = _anthropic_headers()
-                            payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                                       "max_tokens": 4096, "temperature": 0.7, "stream": True}
-                        else:
-                            url = f"{LLM_BASE_URL}/chat/completions"
-                            req_headers = _openai_headers()
-                            payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                                       "stream": True, "temperature": 0.7, "max_tokens": 4096}
+                # 更新条款编号
+                line_start_articles = re.findall(r'^\s*第[一二三四五六七八九十百零\d]+条', chapter_text, re.MULTILINE)
+                if line_start_articles:
+                    clause_number += len(line_start_articles)
+                else:
+                    clause_number += 2
 
-                        async with client.stream("POST", url, headers=req_headers, json=payload) as response:
-                            print(f"[ClauseDraft] 章节「{chapter_name}」HTTP {response.status_code}")
-                            if response.status_code != 200:
-                                error_body = await response.aread()
-                                error_decoded = error_body.decode()[:300]
-                                print(f"[ClauseDraft] Error body: {error_decoded}")
-                                # 错误消息用 error 类型，不混入 content
-                                yield f"data: {json.dumps({'type': 'error', 'message': f'章节「{chapter_name}」LLM调用失败 (HTTP {response.status_code})'}, ensure_ascii=False)}\n\n"
-                                continue
+                # 流式输出（模拟逐字效果）
+                chunk_size = 20
+                for i in range(0, len(chapter_text), chunk_size):
+                    chunk = chapter_text[i:i + chunk_size]
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.005)
 
-                            chunk_count = 0
-                            if _is_anthropic():
-                                async for line in response.aiter_lines():
-                                    line = line.strip()
-                                    if not line or line.startswith("event: "):
-                                        continue
-                                    if line.startswith("data: "):
-                                        try:
-                                            data = json.loads(line[6:].strip())
-                                            if data.get("type") == "content_block_delta":
-                                                delta = data.get("delta", {})
-                                                if delta.get("type") == "text_delta":
-                                                    text = delta.get("text", "")
-                                                    if text:
-                                                        chunk_count += 1
-                                                        chapter_text += text
-                                                        yield f"data: {json.dumps({'type': 'content', 'content': text}, ensure_ascii=False)}\n\n"
-                                            elif data.get("type") == "message_stop":
-                                                break
-                                        except json.JSONDecodeError:
-                                            continue
-                            else:
-                                async for line in response.aiter_lines():
-                                    if not line.startswith("data: "):
-                                        continue
-                                    data_str = line[6:].strip()
-                                    if data_str == "[DONE]":
-                                        break
-                                    try:
-                                        chunk = json.loads(data_str)
-                                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                        text = delta.get("content", "")
-                                        if text:
-                                            chunk_count += 1
-                                            chapter_text += text
-                                            yield f"data: {json.dumps({'type': 'content', 'content': text}, ensure_ascii=False)}\n\n"
-                                    except json.JSONDecodeError:
-                                        continue
-
-                            print(f"[ClauseDraft] 章节「{chapter_name}」完成，收到 {chunk_count} 个文本块")
-
-                        # 检测空章节
-                        if len(chapter_text.strip()) < 20:
-                            print(f"[ClauseDraft] 章节「{chapter_name}」内容过短，补充标准条款")
-                            fallback = f"第{self._num_to_chinese(clause_number)}条 本保险合同的{chapter_name}由保险人与投保人在投保时协商确定，具体内容以保险单载明为准。\n"
-                            chapter_text = fallback
-                            yield f"data: {json.dumps({'type': 'content', 'content': fallback}, ensure_ascii=False)}\n\n"
-                    except Exception as e:
-                        import traceback
-                        print(f"[ClauseDraft] 章节「{chapter_name}」异常: {e}")
-                        traceback.print_exc()
-                        yield f"data: {json.dumps({'type': 'error', 'message': f'章节「{chapter_name}」生成失败：{str(e)}'}, ensure_ascii=False)}\n\n"
-
-                    # 只统计行首的"第X条"作为条款编号（排除正文引用）
-                    line_start_articles = re.findall(r'^\s*第[一二三四五六七八九十百零\d]+条', chapter_text, re.MULTILINE)
-                    if line_start_articles:
-                        clause_number += len(line_start_articles)
-                    else:
-                        clause_number += 2
-
-                    yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
 
             # Step 5: 完成
-            yield f"data: {json.dumps({'type': 'done', 'message': '条款生成完成', 'insurance_type': insurance_type, 'source_products': product_names}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'message': '条款生成完成（模板版）', 'insurance_type': insurance_type, 'source_products': product_names}, ensure_ascii=False)}\n\n"
 
         except Exception as e:
-            # 外层兜底：确保客户端总能收到反馈
             import traceback
-            print(f"[ClauseDraft] draft_stream 外层异常: {e}")
+            print(f"[ClauseDraft-Template] draft_stream 异常: {e}")
             traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'message': f'条款生成异常：{str(e)}'}, ensure_ascii=False)}\n\n"
 
     def is_clause_generation_intent(self, query: str) -> bool:
         """判断是否为条款生成意图（减少误匹配）"""
-        # 必须包含"条款"或"保险"相关上下文，且包含生成类动词
         generation_keywords = ["生成", "起草", "撰写", "编写", "制作", "设计", "创建", "帮我写", "帮我生成", "帮我做", "帮我设计", "帮我创建"]
         context_keywords = ["条款", "保险", "产品"]
         query_lower = query.lower()
