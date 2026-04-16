@@ -5,6 +5,7 @@
 import json
 import re
 import os
+import asyncio
 from typing import AsyncGenerator, List, Dict
 from dotenv import load_dotenv
 
@@ -82,6 +83,124 @@ class ClauseDraftAgent:
             ones = remainder % 10
             return result + digits[tens] + "十" + (digits[ones] if ones else "")
         return str(num)
+
+    # ========== 释义专用逻辑 ==========
+
+    # 常见保险术语名词列表（用于匹配需释义的名词）
+    COMMON_INSURANCE_TERMS = [
+        "保险人", "投保人", "被保险人", "受益人",
+        "保险金额", "保险费", "保险期间", "保险责任", "责任免除",
+        "意外伤害", "意外事故", "伤残", "身故", "全残",
+        "免赔额", "免赔率", "等待期", "观察期", "犹豫期",
+        "赔偿限额", "给付比例", "保险金", "理赔",
+        "不可抗力", "手续费", "现金价值", "保单年度",
+        "医疗机构", "专科医生", "住院", "门诊", "手术",
+        "重大疾病", "轻症疾病", "中症疾病",
+        "职业类别", "危险等级",
+        "保证续保", "续保", "解除合同", "中止", "复效",
+        "如实告知", "年龄误告",
+        "法定继承人", "近亲属",
+    ]
+
+    def _extract_defined_terms(self, all_chapter_text: str, products: List[Dict]) -> List[str]:
+        """从已生成章节文本和产品条款中提取需释义的名词"""
+        found_terms = set()
+
+        # 1. 从已生成文本中提取「」和《》包裹的名词
+        bracket_terms = re.findall(r'「([^」]+)」', all_chapter_text)
+        found_terms.update(bracket_terms)
+
+        # 2. 提取"以下简称XXX"模式
+        aka_terms = re.findall(r'以下简称[""\']?([^""\')】]{2,20})[""\']?', all_chapter_text)
+        found_terms.update(aka_terms)
+
+        # 3. 提取"（以下简称XXX）"模式
+        aka_terms2 = re.findall(r'[（(]以下简称([^)）]+)[)）]', all_chapter_text)
+        found_terms.update(aka_terms2)
+
+        # 4. 从产品条款的"释义"章节中提取已有的名词
+        for product in products:
+            for chapter in product.get("chapters", []):
+                ch_name = chapter.get("chapter_name", "")
+                if "释义" in ch_name:
+                    for section in chapter.get("sections", []):
+                        content = section.get("content", "")
+                        # 匹配 "XXX：..." 或 "XXX是指..." 模式
+                        defined = re.findall(r'^[一二三四五六七八九十\d]+[\.、]\s*([^：:是指]{2,20}?)[：:]', content, re.MULTILINE)
+                        found_terms.update(defined)
+
+        # 5. 与常见术语列表取交集+补集（确保关键术语不遗漏）
+        text_lower = all_chapter_text
+        for term in self.COMMON_INSURANCE_TERMS:
+            if term in text_lower:
+                found_terms.add(term)
+
+        # 过滤太短或太长的
+        result = [t for t in found_terms if 2 <= len(t) <= 20]
+        return sorted(set(result))
+
+    def _build_definition_chapter(self, terms: List[str], products: List[Dict],
+                                   start_number: int) -> str:
+        """构建释义章节：按名词聚合释义，多版本选最新"""
+        # 从所有产品的"释义"章节中收集释义
+        term_definitions = {}  # term -> [{"content": ..., "product_name": ..., "filing_no": ..., "filing_time": ...}]
+
+        for product in products:
+            for chapter in product.get("chapters", []):
+                ch_name = chapter.get("chapter_name", "")
+                if "释义" not in ch_name:
+                    continue
+                filing_no = product.get("filing_no", "")
+                filing_time = product.get("filing_time", "")
+                registry_no = product.get("registry_no", "")
+                product_name = product.get("product_name", "")
+
+                for section in chapter.get("sections", []):
+                    content = section.get("content", "")
+                    # 解析 "XXX：..." 或 "XXX是指..." 格式
+                    for term in terms:
+                        patterns = [
+                            rf'{re.escape(term)}[是指：:]+',
+                            rf'^[一二三四五六七八九十\d]+[\.、]\s*{re.escape(term)}\s*[：:是指]',
+                        ]
+                        for pattern in patterns:
+                            match = re.search(pattern, content)
+                            if match:
+                                if term not in term_definitions:
+                                    term_definitions[term] = []
+                                term_definitions[term].append({
+                                    "content": content,
+                                    "product_name": product_name,
+                                    "filing_no": filing_no,
+                                    "filing_time": filing_time,
+                                    "registry_no": registry_no,
+                                })
+                                break
+
+        # 生成释义条款
+        clauses = []
+        clause_num = start_number
+        for term in terms:
+            defs = term_definitions.get(term, [])
+            if defs:
+                # 按 filing_time 降序排，选最新的
+                defs.sort(key=lambda d: d.get("filing_time", ""), reverse=True)
+                best = defs[0]
+                source = f"[{best['product_name']}"
+                if best.get("registry_no"):
+                    source += f" > {best['registry_no']}"
+                if best.get("filing_time"):
+                    source += f" > {best['filing_time']}"
+                source += "]"
+                clauses.append(f"第{self._num_to_chinese(clause_num)}条 {term}：{best['content']} {source}")
+            else:
+                # 无参考释义，生成占位
+                clauses.append(f"第{self._num_to_chinese(clause_num)}条 {term}：指本保险合同中约定的{term}的含义，具体以保险单载明为准。")
+            clause_num += 1
+
+        if not clauses:
+            return ""
+        return "\n\n".join(clauses) + "\n"
 
     # ========== Step 1: LLM 意图理解 ==========
 
@@ -336,10 +455,45 @@ class ClauseDraftAgent:
 
             yield f"data: {json.dumps({'type': 'progress', 'step': 'chapters', 'message': f'将生成 {len(chapters_to_generate)} 个章节', 'chapters': chapters_to_generate}, ensure_ascii=False)}\n\n"
 
-            # Step 4: 逐章节 LLM 生成
+            # Step 4: 逐章节 LLM 生成（释义章节走专用逻辑）
             clause_number = 1
+            all_generated_text = ""  # 收集已生成文本，用于释义名词提取
             async with httpx.AsyncClient(timeout=120.0) as client:
                 for idx, chapter_name in enumerate(chapters_to_generate):
+
+                    # ===== 释义章节：走专用逻辑（不调LLM） =====
+                    if chapter_name == "释义":
+                        yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'type': 'content', 'content': f'## {chapter_name}\n\n'}, ensure_ascii=False)}\n\n"
+
+                        yield f"data: {json.dumps({'type': 'progress', 'step': 'definition', 'message': '正在提取需释义名词...'}, ensure_ascii=False)}\n\n"
+                        terms = self._extract_defined_terms(all_generated_text, products)
+                        print(f"[ClauseDraft] 释义：提取到 {len(terms)} 个名词")
+
+                        yield f"data: {json.dumps({'type': 'progress', 'step': 'definition', 'message': f'生成 {len(terms)} 个名词释义'}, ensure_ascii=False)}\n\n"
+                        definition_text = self._build_definition_chapter(terms, products, clause_number)
+
+                        if definition_text:
+                            # 流式输出释义内容
+                            chunk_size = 40
+                            for i in range(0, len(definition_text), chunk_size):
+                                chunk = definition_text[i:i + chunk_size]
+                                yield f"data: {json.dumps({'type': 'content', 'content': chunk}, ensure_ascii=False)}\n\n"
+                                await asyncio.sleep(0.005)
+
+                            # 更新编号
+                            line_start_articles = re.findall(r'^\s*第[一二三四五六七八九十百零\d]+条', definition_text, re.MULTILINE)
+                            clause_number += len(line_start_articles) if line_start_articles else len(terms)
+                            all_generated_text += "\n" + definition_text
+                        else:
+                            fallback = f"第{self._num_to_chinese(clause_number)}条 本保险合同中使用的术语和名词，其含义以保险单载明为准。\n"
+                            yield f"data: {json.dumps({'type': 'content', 'content': fallback}, ensure_ascii=False)}\n\n"
+                            clause_number += 1
+
+                        yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
+                        continue
+
+                    # ===== 普通章节：LLM 流式生成 =====
                     refs = chapter_refs.get(chapter_name, [])
                     prompt = self._build_chapter_prompt(chapter_name, refs, insurance_type, chapters_to_generate, start_number=clause_number)
 
@@ -431,6 +585,7 @@ class ClauseDraftAgent:
                     else:
                         clause_number += 2
 
+                    all_generated_text += "\n" + chapter_text
                     yield f"data: {json.dumps({'type': 'content', 'content': '\n\n'}, ensure_ascii=False)}\n\n"
 
             # Step 5: 完成

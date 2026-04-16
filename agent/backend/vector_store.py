@@ -37,17 +37,21 @@ class VectorSearchResult:
     product_id: str
     product_name: str
     filing_no: str
-    chapter_name: str
-    section_id: str
-    title: str
-    content: str
-    score: float
+    filing_time: str = ""
+    registry_no: str = ""
+    chapter_name: str = ""
+    section_id: str = ""
+    title: str = ""
+    content: str = ""
+    score: float = 0.0
 
     def to_dict(self) -> dict:
         return {
             "product_id": self.product_id,
             "product_name": self.product_name,
             "filing_no": self.filing_no,
+            "filing_time": self.filing_time,
+            "registry_no": self.registry_no,
             "chapter_name": self.chapter_name,
             "section_id": self.section_id,
             "title": self.title,
@@ -199,6 +203,8 @@ class VectorStore:
                         "product_id": product["id"],
                         "product_name": product["product_name"],
                         "filing_no": product["filing_no"],
+                        "filing_time": product.get("filing_time", ""),
+                        "registry_no": product.get("registry_no", ""),
                         "chapter_name": chapter["chapter_name"],
                         "section_id": section["section_id"],
                         "title": section["title"],
@@ -221,6 +227,8 @@ class VectorStore:
                     "product_id": pt["product_id"],
                     "product_name": pt["product_name"],
                     "filing_no": pt["filing_no"],
+                    "filing_time": pt.get("filing_time", ""),
+                    "registry_no": pt.get("registry_no", ""),
                     "chapter_name": pt["chapter_name"],
                     "section_id": pt["section_id"],
                     "title": pt["title"],
@@ -283,6 +291,8 @@ class VectorStore:
                     product_id=hit.payload["product_id"],
                     product_name=hit.payload["product_name"],
                     filing_no=hit.payload["filing_no"],
+                    filing_time=hit.payload.get("filing_time", ""),
+                    registry_no=hit.payload.get("registry_no", ""),
                     chapter_name=hit.payload["chapter_name"],
                     section_id=hit.payload["section_id"],
                     title=hit.payload["title"],
@@ -297,6 +307,8 @@ class VectorStore:
                 product_id=hit.payload["product_id"],
                 product_name=hit.payload["product_name"],
                 filing_no=hit.payload["filing_no"],
+                filing_time=hit.payload.get("filing_time", ""),
+                registry_no=hit.payload.get("registry_no", ""),
                 chapter_name=hit.payload["chapter_name"],
                 section_id=hit.payload["section_id"],
                 title=hit.payload["title"],
