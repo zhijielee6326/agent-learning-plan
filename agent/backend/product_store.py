@@ -107,14 +107,31 @@ class ProductStore:
 
         # 3. 加载 CSV 精算数据
         csv_dir = os.path.dirname(self.data_path)
+        csv_meta = {}  # 产品名 → 元数据
         for csv_fname in os.listdir(csv_dir):
             if csv_fname.endswith(".csv") and not csv_fname.startswith("."):
                 csv_path = os.path.join(csv_dir, csv_fname)
                 try:
                     csv_count = self._load_csv_products(csv_path)
+                    # 收集 CSV 元数据用于回填 output 产品
+                    self._collect_csv_metadata(csv_path, csv_meta)
                     print(f"[ProductStore] CSV文件 {csv_fname} 已加载 {csv_count} 个产品")
                 except Exception as e:
                     print(f"[ProductStore] 加载CSV {csv_fname} 失败: {e}")
+
+        # 4. 用 CSV 元数据回填 output 产品的 filing_no / filing_time / registry_no
+        backfilled = 0
+        for product in self.products:
+            if product["id"].startswith("OUT-"):
+                name = product["product_name"]
+                if name in csv_meta:
+                    meta = csv_meta[name]
+                    for key in ["filing_no", "filing_time", "registry_no", "registry_time"]:
+                        if not product.get(key) and meta.get(key):
+                            product[key] = meta[key]
+                    backfilled += 1
+        if backfilled:
+            print(f"[ProductStore] 已回填 {backfilled} 个 output 产品的元数据")
 
     def _load_csv_products(self, csv_path: str) -> int:
         """加载CSV精算数据文件中的产品"""
@@ -132,6 +149,9 @@ class ProductStore:
                     continue
                 insurance_cat = row.get("insurance_category", "").strip().strip('"')
                 filing_no = row.get("filing_no", "").strip().strip('"')
+                filing_time = row.get("filing_time", "").strip().strip('"')
+                registry_no = row.get("registry_no", "").strip().strip('"')
+                registry_time = row.get("registry_time", "").strip().strip('"')
                 clause_type = row.get("clause_type", "").strip().strip('"')
                 product_code = row.get("act_product_code", "").strip().strip('"')
                 category, sub_category = self._infer_category(product_name)
@@ -172,12 +192,30 @@ class ProductStore:
                     "sub_category": sub_category,
                     "version": "",
                     "filing_no": filing_no,
+                    "filing_time": filing_time,
+                    "registry_no": registry_no,
+                    "registry_time": registry_time,
                     "chapters": chapters
                 }
                 self.products.append(product)
                 existing_names.add(product_name)
                 count += 1
         return count
+
+    def _collect_csv_metadata(self, csv_path: str, meta_map: Dict[str, Dict]):
+        """从 CSV 中收集产品元数据（用于回填 output 产品）"""
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row.get("act_product_name", "").strip().strip('"')
+                if not name:
+                    continue
+                meta_map[name] = {
+                    "filing_no": row.get("filing_no", "").strip().strip('"'),
+                    "filing_time": row.get("filing_time", "").strip().strip('"'),
+                    "registry_no": row.get("registry_no", "").strip().strip('"'),
+                    "registry_time": row.get("registry_time", "").strip().strip('"'),
+                }
 
     def _convert_output_product(self, data: Dict, index: int) -> Optional[Dict]:
         """将 output/ 目录下的产品JSON转换为标准产品格式"""
@@ -225,6 +263,9 @@ class ProductStore:
             "sub_category": sub_category,
             "version": "",
             "filing_no": "",
+            "filing_time": "",
+            "registry_no": "",
+            "registry_time": "",
             "chapters": chapters
         }
 

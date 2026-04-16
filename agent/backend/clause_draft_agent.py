@@ -58,6 +58,98 @@ class ClauseDraftAgent:
             return result + digits[tens] + "十" + (digits[ones] if ones else "")
         return str(num)
 
+    # ========== 释义专用逻辑 ==========
+
+    COMMON_INSURANCE_TERMS = [
+        "保险人", "投保人", "被保险人", "受益人",
+        "保险金额", "保险费", "保险期间", "保险责任", "责任免除",
+        "意外伤害", "意外事故", "伤残", "身故", "全残",
+        "免赔额", "免赔率", "等待期", "观察期", "犹豫期",
+        "赔偿限额", "给付比例", "保险金", "理赔",
+        "不可抗力", "手续费", "现金价值", "保单年度",
+        "医疗机构", "专科医生", "住院", "门诊", "手术",
+        "重大疾病", "轻症疾病", "中症疾病",
+        "职业类别", "危险等级",
+        "保证续保", "续保", "解除合同", "中止", "复效",
+        "如实告知", "年龄误告",
+        "法定继承人", "近亲属",
+    ]
+
+    def _extract_defined_terms(self, all_chapter_text: str, products: List[Dict]) -> List[str]:
+        """从已生成章节文本和产品条款中提取需释义的名词"""
+        found_terms = set()
+        bracket_terms = re.findall(r'「([^」]+)」', all_chapter_text)
+        found_terms.update(bracket_terms)
+        aka_terms = re.findall(r'以下简称[""\']?([^""\')】]{2,20})[""\']?', all_chapter_text)
+        found_terms.update(aka_terms)
+        aka_terms2 = re.findall(r'[（(]以下简称([^)）]+)[)）]', all_chapter_text)
+        found_terms.update(aka_terms2)
+        for product in products:
+            for chapter in product.get("chapters", []):
+                ch_name = chapter.get("chapter_name", "")
+                if "释义" in ch_name:
+                    for section in chapter.get("sections", []):
+                        content = section.get("content", "")
+                        defined = re.findall(r'^[一二三四五六七八九十\d]+[\.、]\s*([^：:是指]{2,20}?)[：:]', content, re.MULTILINE)
+                        found_terms.update(defined)
+        for term in self.COMMON_INSURANCE_TERMS:
+            if term in all_chapter_text:
+                found_terms.add(term)
+        result = [t for t in found_terms if 2 <= len(t) <= 20]
+        return sorted(set(result))
+
+    def _build_definition_chapter(self, terms: List[str], products: List[Dict],
+                                   start_number: int) -> str:
+        """构建释义章节：按名词聚合释义，多版本选最新"""
+        term_definitions = {}
+        for product in products:
+            for chapter in product.get("chapters", []):
+                ch_name = chapter.get("chapter_name", "")
+                if "释义" not in ch_name:
+                    continue
+                filing_no = product.get("filing_no", "")
+                filing_time = product.get("filing_time", "")
+                registry_no = product.get("registry_no", "")
+                product_name = product.get("product_name", "")
+                for section in chapter.get("sections", []):
+                    content = section.get("content", "")
+                    for term in terms:
+                        patterns = [
+                            rf'{re.escape(term)}[是指：:]+',
+                            rf'^[一二三四五六七八九十\d]+[\.、]\s*{re.escape(term)}\s*[：:是指]',
+                        ]
+                        for pattern in patterns:
+                            match = re.search(pattern, content)
+                            if match:
+                                if term not in term_definitions:
+                                    term_definitions[term] = []
+                                term_definitions[term].append({
+                                    "content": content, "product_name": product_name,
+                                    "filing_no": filing_no, "filing_time": filing_time,
+                                    "registry_no": registry_no,
+                                })
+                                break
+        clauses = []
+        clause_num = start_number
+        for term in terms:
+            defs = term_definitions.get(term, [])
+            if defs:
+                defs.sort(key=lambda d: d.get("filing_time", ""), reverse=True)
+                best = defs[0]
+                source = f"[{best['product_name']}"
+                if best.get("registry_no"):
+                    source += f" > {best['registry_no']}"
+                if best.get("filing_time"):
+                    source += f" > {best['filing_time']}"
+                source += "]"
+                clauses.append(f"第{self._num_to_chinese(clause_num)}条 {term}：{best['content']} {source}")
+            else:
+                clauses.append(f"第{self._num_to_chinese(clause_num)}条 {term}：指本保险合同中约定的{term}的含义，具体以保险单载明为准。")
+            clause_num += 1
+        if not clauses:
+            return ""
+        return "\n\n".join(clauses) + "\n"
+
     # ========== Step 1: 规则意图识别（不调LLM） ==========
 
     def _extract_insurance_type(self, query: str) -> str:
@@ -257,14 +349,22 @@ class ClauseDraftAgent:
 
             # Step 4: 模板拼装 — 每章取最优参考，去重合并
             clause_number = 1
+            all_chapter_text = ""  # 收集所有章节文本，用于释义提取
             for idx, chapter_name in enumerate(chapters_to_generate):
                 yield f"data: {json.dumps({'type': 'chapter_start', 'chapter': chapter_name, 'index': idx, 'total': len(chapters_to_generate)}, ensure_ascii=False)}\n\n"
 
                 chapter_header = f"## {chapter_name}\n\n"
                 yield f"data: {json.dumps({'type': 'content', 'content': chapter_header}, ensure_ascii=False)}\n\n"
 
-                refs = chapter_refs.get(chapter_name, [])
-                chapter_text = self._assemble_chapter(chapter_name, refs, clause_number)
+                if chapter_name == "释义":
+                    # 释义章节：专用逻辑 — 提取名词 + 聚合释义 + 选最新版本
+                    terms = self._extract_defined_terms(all_chapter_text, products)
+                    chapter_text = self._build_definition_chapter(terms, products, clause_number)
+                else:
+                    refs = chapter_refs.get(chapter_name, [])
+                    chapter_text = self._assemble_chapter(chapter_name, refs, clause_number)
+
+                all_chapter_text += chapter_text + "\n"
 
                 # 更新条款编号
                 line_start_articles = re.findall(r'^\s*第[一二三四五六七八九十百零\d]+条', chapter_text, re.MULTILINE)
