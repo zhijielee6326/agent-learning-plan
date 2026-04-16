@@ -43,6 +43,11 @@ export default function Home() {
   // 导出加载状态
   const [isExporting, setIsExporting] = useState(false)
 
+  // 释义管理面板
+  const [showDefPanel, setShowDefPanel] = useState(false)
+  const [editingDefIdx, setEditingDefIdx] = useState<number | null>(null)
+  const [editingDefText, setEditingDefText] = useState('')
+
   // Refs
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -71,6 +76,74 @@ export default function Home() {
     lastRenderedRef.current = ''
     setEditorContent(prev)
   }, [])
+
+  // ========== 释义管理 ==========
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type DefItem = { term: string; content: string; source: string; fullLine: string }
+
+  const parseDefinitions = useCallback((md: string): DefItem[] => {
+    const defs: DefItem[] = []
+    const lines = md.split('\n')
+    let inDefSection = false
+    for (const line of lines) {
+      if (/^##\s+释义/.test(line)) { inDefSection = true; continue }
+      if (inDefSection && /^##\s/.test(line)) break
+      if (!inDefSection) continue
+      const match = line.match(/^第[一二三四五六七八九十百零\d]+条\s+(.+?)[：:]+([\s\S]+)$/)
+      if (match) {
+        const term = match[1].trim()
+        const rest = match[2].trim()
+        const srcMatch = rest.match(/\[([^\]]+?)\]\s*$/)
+        const source = srcMatch ? srcMatch[1] : ''
+        const content = srcMatch ? rest.slice(0, srcMatch.index).trim() : rest
+        defs.push({ term, content, source, fullLine: line })
+      }
+    }
+    return defs
+  }, [])
+
+  const getDefItems = useCallback((): DefItem[] => {
+    return parseDefinitions(editorContent)
+  }, [editorContent, parseDefinitions])
+
+  const deleteDefItem = useCallback((idx: number) => {
+    pushUndo(editorContent)
+    const lines = editorContent.split('\n')
+    const newLines: string[] = []
+    let inDefSection = false
+    let defCount = 0
+    for (const line of lines) {
+      if (/^##\s+释义/.test(line)) { inDefSection = true; newLines.push(line); continue }
+      if (inDefSection && /^##\s/.test(line)) { inDefSection = false; newLines.push(line); continue }
+      if (inDefSection && /^第[一二三四五六七八九十百零\d]+条/.test(line)) {
+        if (defCount === idx) { defCount++; continue }  // skip deleted item
+        defCount++
+      }
+      newLines.push(line)
+    }
+    setEditorContent(newLines.join('\n'))
+    lastRenderedRef.current = ''
+  }, [editorContent, pushUndo])
+
+  const saveDefEdit = useCallback((idx: number, newText: string) => {
+    pushUndo(editorContent)
+    const lines = editorContent.split('\n')
+    const newLines: string[] = []
+    let inDefSection = false
+    let defCount = 0
+    for (const line of lines) {
+      if (/^##\s+释义/.test(line)) { inDefSection = true; newLines.push(line); continue }
+      if (inDefSection && /^##\s/.test(line)) { inDefSection = false; newLines.push(line); continue }
+      if (inDefSection && /^第[一二三四五六七八九十百零\d]+条/.test(line)) {
+        if (defCount === idx) { newLines.push(newText); defCount++; continue }
+        defCount++
+      }
+      newLines.push(line)
+    }
+    setEditorContent(newLines.join('\n'))
+    lastRenderedRef.current = ''
+    setEditingDefIdx(null)
+  }, [editorContent, pushUndo])
 
   // ========== 会话持久化 ==========
   const saveToStorage = useCallback((s: ChatSession[]) => {
@@ -638,6 +711,12 @@ export default function Home() {
               className="px-2 py-1 text-[11px] rounded-md bg-slate-50 text-slate-500 hover:bg-slate-100 border border-slate-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed">
               {isExporting ? '导出中...' : '导出 Word'}
             </button>
+            {getDefItems().length > 0 && (
+              <button onClick={() => setShowDefPanel(!showDefPanel)}
+                className={`px-2 py-1 text-[11px] rounded-md border transition-all ${showDefPanel ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-slate-50 text-slate-500 hover:bg-slate-100 border-slate-200'}`}>
+                释义管理 ({getDefItems().length})
+              </button>
+            )}
           </div>
         </div>
 
@@ -658,20 +737,20 @@ export default function Home() {
             </div>
           )}
 
-          {/* 文档编辑区 */}
-          <div className="flex-1 overflow-y-auto relative">
-            <div className="max-w-3xl mx-auto px-10 py-8">
-              {isEditing ? (
-                <textarea ref={textareaRef}
-                  defaultValue={editorContent}
-                  className="w-full min-h-[600px] p-4 rounded-lg border border-blue-200 bg-blue-50/30 font-mono text-[13px] leading-relaxed text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-300 resize-y"
-                  placeholder="Markdown 内容..." />
-              ) : (
-                <div ref={editorRef}
-                  className="doc-editor-content doc-readonly"
-                  onMouseUp={handleMouseUp} />
-              )}
-            </div>
+          {/* 文档编辑区 + 释义面板 */}
+            <div className="flex-1 overflow-y-auto relative">
+              <div className="max-w-3xl mx-auto px-10 py-8">
+                {isEditing ? (
+                  <textarea ref={textareaRef}
+                    defaultValue={editorContent}
+                    className="w-full min-h-[600px] p-4 rounded-lg border border-blue-200 bg-blue-50/30 font-mono text-[13px] leading-relaxed text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-300 resize-y"
+                    placeholder="Markdown 内容..." />
+                ) : (
+                  <div ref={editorRef}
+                    className="doc-editor-content doc-readonly"
+                    onMouseUp={handleMouseUp} />
+                )}
+              </div>
 
             {/* AI 浮动弹窗 */}
             {selectionPosition && selectedText && (
@@ -743,10 +822,60 @@ export default function Home() {
                 )}
               </div>
             )}
+            </div>
+
+          {/* 释义管理侧面板 */}
+          {showDefPanel && (
+            <div className="w-80 border-l border-slate-200 bg-white overflow-y-auto shrink-0">
+              <div className="sticky top-0 bg-white border-b border-slate-100 px-3 py-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-700">释义管理</span>
+                <button onClick={() => { setShowDefPanel(false); setEditingDefIdx(null) }}
+                  className="text-[10px] text-slate-400 hover:text-red-500 transition-colors">关闭</button>
+              </div>
+              <div className="p-3 space-y-2">
+                {getDefItems().map((def, idx) => (
+                  <div key={idx} className="rounded-lg border border-slate-200 bg-slate-50/50 overflow-hidden">
+                    <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-blue-600">{def.term}</span>
+                      <div className="flex gap-1">
+                        <button onClick={() => { setEditingDefIdx(idx); setEditingDefText(def.fullLine) }}
+                          className="text-[9px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-500 hover:bg-blue-100 border border-blue-200 transition-all">
+                          {editingDefIdx === idx ? '取消' : '编辑'}
+                        </button>
+                        <button onClick={() => deleteDefItem(idx)}
+                          className="text-[9px] px-1.5 py-0.5 rounded bg-red-50 text-red-500 hover:bg-red-100 border border-red-200 transition-all">
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                    {editingDefIdx === idx ? (
+                      <div className="p-2">
+                        <textarea value={editingDefText}
+                          onChange={e => setEditingDefText(e.target.value)}
+                          className="w-full text-[11px] p-2 rounded border border-blue-200 bg-white font-mono leading-relaxed resize-y min-h-[60px] focus:outline-none focus:ring-1 focus:ring-blue-300" />
+                        <button onClick={() => saveDefEdit(idx, editingDefText)}
+                          className="mt-1 w-full py-1 text-[10px] bg-blue-500 text-white rounded hover:bg-blue-600 transition-all font-medium">
+                          保存
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="px-3 py-2">
+                        <p className="text-[11px] text-slate-600 leading-relaxed line-clamp-4">{def.content}</p>
+                        {def.source && (
+                          <p className="text-[9px] text-blue-400 mt-1 truncate" title={def.source}>来源：{def.source}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {getDefItems().length === 0 && (
+                  <p className="text-[11px] text-slate-400 text-center py-6">暂无释义条目</p>
+                )}
+              </div>
+            </div>
+          )}
           </div>
         </div>
-
-      </div>
       )}
     </div>
   )
